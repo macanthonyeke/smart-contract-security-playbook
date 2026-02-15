@@ -1,113 +1,102 @@
-# Reward Accounting
+# Reward Accounting in YieldCore
 
 ## 1. Title
-Reward Accounting
+Reward Accounting in YieldCore
 
 ## 2. Overview
-Reward accounting must allocate emissions proportionally over time and stake weight without creating phantom rewards or unfair extraction opportunities.
+YieldCore rewards are per-stake, fixed-rate, and time-proportional, with accrual capped at `MAX_REWARD_TIME = 1 day`. Rewards are paid from a shared `rewardPool` balance funded by owner deposits and augmented by early-unstake penalties.
 
-## 3. Core Mental Model
-**Definition:** Use a cumulative index (`accRewardPerShare`) and per-user checkpoint (`rewardDebt`) so entitlement is the delta between current index exposure and previously settled exposure.
+## 3. Exact YieldCore Accounting Mechanics
+Per stake fields:
+- `amount`
+- `startTime`
+- `lockPeriod`
+- `fixedRate`
+- `rewardsClaimed`
+- `active`, `expired`
 
-Core equations:
-- `pending_u = amount_u * accRPS / PRECISION - rewardDebt_u`
-- After mutation: `rewardDebt_u = amount_u * accRPS / PRECISION`
+Core reward formula in `calculateReward`:
+- If inactive/expired/past grace expiry => `0`.
+- `timeElapsed = min(block.timestamp - startTime, 1 day)`.
+- `totalEarned = amount * fixedRate * timeElapsed / (100 * 1 day)`.
+- claimable = `max(totalEarned - rewardsClaimed, 0)`.
 
-### Why This Matters in DeFi/Real Protocols
-Incorrect reward math silently transfers value between users and can bankrupt incentive pools long before operators detect insolvency.
+Implication: rewards stop increasing after one day from `startTime`, independent of longer lock periods.
 
-## 4. Minimal Vulnerable Example (Solidity or pseudocode)
-```solidity
-function deposit(uint256 a) external {
-    // bug: user amount changes before settling pending
-    amount[msg.sender] += a;
-    rewardDebt[msg.sender] = amount[msg.sender] * accRPS / 1e12;
-    stake.transferFrom(msg.sender, address(this), a);
-}
+## 4. Function-by-Function Reward-Accounting Review (All Public Functions)
+1. `setLockParameters`: Sets future `fixedRate` only at stake creation; historical stakes keep prior rates.
+2. `fundRewardPool`: Increases reward solvency but does not verify projected liabilities.
+3. `stake`: Snapshots rate into `fixedRate`; no liability reservation is created on entry.
+4. `calculateReward`: Uses fixed `startTime` (not last-claim timestamp), compensated by `rewardsClaimed` subtraction.
+5. `claimReward`: Deducts from `rewardPool`; reverts if pool underfunded.
+6. `unstake`: If lock expired, pays principal + remaining reward; if early, applies penalty and recycles penalty into `rewardPool`.
+7. `cleanUpExpiredStake`: Changes reward eligibility indirectly by setting `expired`.
+8. `emergencyWithdraw`: Returns principal only while paused; reward entitlement is effectively abandoned.
+9. `withdrawExcessRewards`: Can alter available liquidity and perceived solvency under paused mode.
+10. `maxReward`: Returns `amount * fixedRate / 100`; aligns with 1-day cap design.
+11. `getStakeCount`: View.
+12. `getStake`: View.
+13. `getRewardsClaimed`: View.
+14. `getContractBalance`: View.
+15. `pause`: Accounting halted for most user actions.
+16. `unpause`: Resumes flows.
 
-function claim() external {
-    uint256 p = amount[msg.sender] * accRPS / 1e12 - rewardDebt[msg.sender];
-    rewardDebt[msg.sender] = amount[msg.sender] * accRPS / 1e12;
-    reward.transfer(msg.sender, p);
-}
-```
+## 5. Fixed-Rate-per-Stake vs `accRewardPerShare`
+### Current fixed-rate model strengths
+- Easy to reason about per user.
+- No global accumulator drift complexity.
 
-## 5. Realistic Exploit Scenario (step-by-step transaction flow)
-Front-run timing race:
-1. Keeper tx in mempool will call `updatePool()` and increase `accRPS`.
-2. Attacker `TxA` deposits just before keeper update.
-3. `TxK` executes update with new emission delta.
-4. Attacker `TxB` claims immediately.
-5. If ordering/checkpoint logic is wrong, attacker captures disproportionate share.
+### Weaknesses
+- No global notion of emission budget over time.
+- Solvency depends on owner operations and penalty recycling.
+- Different cohorts may face payout failures if rewardPool lags liabilities.
 
-Underfunded pool sequence:
-1. Protocol sets high emission schedule without funded reserve.
-2. Early claimers drain reward token balance.
-3. Later claims revert or underpay.
-4. Pool appears healthy by accounting, but payout solvency invariant is broken.
+### `accRewardPerShare` alternative
+- Defines deterministic emission per block/second distributed by share.
+- Improves fairness under dynamic participation.
+- Easier to prove conservation invariants.
 
-Rounding residue numeric example:
-- Epoch rewards: 10 tokens each for 3 epochs.
-- Total shares each epoch = 3.
-- Per epoch distribution: `10/3 = 3` each, residue `1` token.
-- If residue is not carried, 3 tokens total become extractable dust.
-- Attacker cycles tiny stake around epoch boundaries to capture dust-biased rounding repeatedly.
+Tradeoff:
+- More complex checkpoint logic and update scheduling.
 
-Public references:
-- MasterChef-style reward distribution design discussions and known mis-implementations in yield farms.
+## 6. Fairness of the 1-Day Reward Cap
+The 1-day cap simplifies risk but can be economically unintuitive:
+- Long lock periods do not produce proportionally longer yield.
+- Users can wait until lock maturity while earning only day-one reward.
+- Strategic users may cluster behavior around cap timing, reducing intended lock incentive.
 
-## 6. Defensive Design Patterns
-- `updatePool` first, then settle user, then mutate stake, then checkpoint debt.
-- Enforce funded emissions (`distributed <= funded + reserve`).
-- Carry residue forward explicitly in accumulator.
-- Use high precision and tested rounding policy.
-- Bound same-block claim/deposit edge behavior.
+Alternative:
+- Piecewise accrual curve (e.g., linear to lock end or bounded APY schedule).
 
-Specific off-by-one logic errors:
-- Using `lastRewardBlock = block.number` before computing elapsed blocks.
-- Including current block twice in elapsed interval.
-- Incorrect epoch boundary comparison (`<` vs `<=`) causing one extra emission step.
+## 7. Solvency and Sustainability
+Current solvency gate is local (`require(reward <= rewardPool)` on payout). Missing global safeguards:
+- No proactive check that newly created stake liabilities are financeable.
+- No reserve ratio target.
+- No emission throttle when underfunded.
 
-## 7. EVM-Level Reasoning
-- Integer division truncation is exploitable through repeated low-cost calls.
-- Token transfers may deliver less than nominal amount; accounting must use balance deltas.
-- Reentrancy through token hooks can desync `amount` and `rewardDebt` if not guarded.
+Safer pattern:
+- Track `totalRewardLiability` and require `rewardPool >= bufferedLiability` at critical transitions.
 
-## 8. Common Developer Mistakes
-- Updating debt before paying pending rewards.
-- Assuming rewards are always funded.
-- Ignoring fee-on-transfer/rebasing semantics.
-- Not testing boundary blocks/epochs.
+## 8. Design Improvements & Hardening Opportunities in YieldCore
+### Weaknesses / limitations
+- Liability is implicit, not fully accounted as first-class state.
+- RewardPool can be stressed by batch unlock claims.
+- Penalty recycling may mask true sustainability issues.
 
-## 9. Explicit, Strong Invariants
-```solidity
-function invariant_emissionSolvency() public {
-    assertLe(totalClaimed(), totalFunded() + initialReserve());
-}
+### Alternative designs
+1. **Liability-reserving stake entry**
+   - Reserve max claimable reward at stake creation.
+2. **Global reward index with emission schedule**
+   - Move from fixed per-stake rates to system-level emissions.
+3. **Dual-pool architecture**
+   - Separate principal custody from reward treasury to prevent accounting ambiguity.
 
-function invariant_debtConsistency(address u) public {
-    assertEq(rewardDebt(u), amount(u) * accRPS() / PRECISION);
-}
+### Tradeoffs
+- **Gas:** more state writes and updates.
+- **Complexity:** more math and operational controls.
+- **UX:** possibly dynamic APR instead of fixed promise.
+- **Security:** materially stronger solvency guarantees.
 
-function invariant_residueConservation() public {
-    assertEq(totalDistributed() + residue(), totalAccrued());
-}
-```
+### Real DeFi grounding
+- MasterChef-style index systems and gauge-based emission models provide mature templates for deterministic reward distribution and auditable liability management.
 
-Solidity test examples:
-```solidity
-function test_underfundedPool_revertsClaim() public {
-    fund(1 ether); setEmission(100 ether);
-    vm.expectRevert(); pool.claim();
-}
-
-function test_frontRunDepositClaimBoundary() public {
-    // simulate attacker deposit before update and immediate claim
-    // assert payout <= fairShare + epsilon
-}
-```
-
-### How Tests Should Catch This
-- Stateful fuzzing with randomized `deposit/withdraw/claim/updatePool` ordering should fail if debt consistency breaks.
-- Epoch-boundary tests should assert no extra block rewards are minted.
-- Adversarial tiny-stake loop should not increase attacker EV beyond configured rounding epsilon.
