@@ -1,125 +1,95 @@
-# Reentrancy
+# Reentrancy in YieldCore
 
 ## 1. Title
-Reentrancy
+Reentrancy in YieldCore
 
 ## 2. Overview
-Reentrancy is a control-flow attack where untrusted external code re-enters protocol logic before the original function completes, allowing repeated use of stale assumptions.
+YieldCore uses `ReentrancyGuard` on `claimReward`, `unstake`, `emergencyWithdraw`, and `withdrawExcessRewards`, and uses CEI-style state updates before token transfers in those paths. This blocks classic recursive drain patterns in payout functions, but security analysis must still cover cross-function behavior, multi-stake indexing, and token callback assumptions.
 
-## 3. Core Mental Model
-**Definition:** A state transition is reentrant-vulnerable when external control transfer occurs before all critical state writes that enforce value conservation and authorization.
+## 3. YieldCore Reentrancy Surfaces
+Key external interaction points are all `stakingToken.safeTransfer(...)` / `safeTransferFrom(...)` operations.
 
-Think in three layers:
-1. **Precondition snapshot** (what checks depend on).
-2. **State transition** (what must become true atomically).
-3. **External interaction boundary** (where attacker can interrupt).
+- `fundRewardPool` and `stake` perform `safeTransferFrom` without `nonReentrant`.
+- `claimReward`, `unstake`, `emergencyWithdraw`, and `withdrawExcessRewards` are guarded by `nonReentrant`.
+- Reward computation is split into view logic (`calculateReward`) and mutating payout logic, which can create stale-read risks if future upgrades add new external calls around those reads.
 
-If layer (3) happens before layer (2) is finalized, invariants can be violated under nested call graphs.
+### Why this matters for this contract
+Even when a single function is guarded, reentrancy can still appear as:
+- Cross-function entry via unguarded endpoints.
+- Multi-index abuse if bookkeeping is inconsistent between stake slots.
+- Token-standard edge behavior (non-standard ERC20s with callbacks/proxy hooks).
 
-Reentrancy taxonomy:
-- Single-function reentrancy.
-- Cross-function reentrancy.
-- Cross-contract reentrancy.
-- Read-only reentrancy.
-- Token-hook reentrancy (ERC777/1155).
+## 4. Function-by-Function Reentrancy Review (All Public Functions)
+1. `setLockParameters`: No external call. Improvement: add bounds for `_dailyRate` and `_penaltyRate` to reduce governance misconfiguration risk.
+2. `fundRewardPool`: External token transfer before `rewardPool += _amount`. Safer accounting alternative: use balance-delta accounting to handle fee-on-transfer tokens.
+3. `stake`: External transfer before struct push; no `nonReentrant`. Usually acceptable for standard ERC20, but adding `nonReentrant` or pull-deposit batching reduces callback assumptions.
+4. `calculateReward`: View-only; edge case is out-of-bounds index revert and timestamp boundary sensitivity.
+5. `claimReward`: Properly guarded and updates state before transfer. Improvement: explicitly mark expired stakes in this path for consistency.
+6. `unstake`: Guarded and CEI-aligned. Improvement: `require(s.active)` should likely replace `require(s.active || s.expired)` to avoid odd semantics after cleanup.
+7. `cleanUpExpiredStake`: Owner-only, no transfer. Improvement: validate index via custom errors for clearer operations monitoring.
+8. `emergencyWithdraw`: Guarded. Improvement: if token is fee-on-transfer, user may not receive full principal; design should document or enforce token type.
+9. `withdrawExcessRewards`: Guarded. Improvement: can drain principal-backed “excess” while paused; should exclude active principal liabilities.
+10. `maxReward`: View helper, but returns a simplified cap (`amount * rate / 100`) that may diverge from nuanced expectations.
+11. `getStakeCount`: Safe view.
+12. `getStake`: Safe view, but reverts on bad index.
+13. `getRewardsClaimed`: Safe view, but reverts on bad index.
+14. `getContractBalance`: Safe view.
+15. `pause`: Owner-only; no delay.
+16. `unpause`: Owner-only; no safety delay or checklist.
 
-### Why This Matters in DeFi/Real Protocols
-Lending, vaults, and AMMs rely on globally consistent balances, debt shares, and price snapshots. Reentrancy breaks this consistency and can turn small local bugs into system-wide insolvency.
+## 5. Is `nonReentrant` on `claimReward` and `unstake` sufficient?
+It is sufficient for the highest-value payout paths in the current code, but not a complete strategy:
 
-## 4. Minimal Vulnerable Example (Solidity or pseudocode)
-```solidity
-contract Vault {
-    mapping(address => uint256) public bal;
+- It does not protect `stake` / `fundRewardPool` against unexpected callback behavior.
+- It does not solve economic or accounting bugs; only recursive control-flow abuse.
+- It assumes no future function introduces a new external call before state convergence.
 
-    function deposit() external payable {
-        bal[msg.sender] += msg.value;
-    }
+Recommended hardening:
+- Add explicit token allowlist assumptions (plain ERC20 only).
+- Keep CEI strict in every mutating function.
+- Add invariant tests that attempt callback-driven entry across all public mutators.
 
-    function withdraw(uint256 amount) external {
-        require(bal[msg.sender] >= amount, "insufficient");
-        (bool ok,) = msg.sender.call{value: amount}(""); // interaction first
-        require(ok, "send failed");
-        bal[msg.sender] -= amount; // effect too late
-    }
-}
-```
+## 6. Multi-Stake Index Reentrancy Considerations
+YieldCore stores `stakes[user]` as an array, so each index behaves like a mini-position. Reentrancy risks are lower because guarded payout functions serialize entry, but design concerns remain:
 
-ERC777 hook-shaped vulnerability:
-```solidity
-function deposit777(uint256 amount) external {
-    shares[msg.sender] += previewShares(amount); // credited early
-    rewardDebt[msg.sender] = shares[msg.sender] * accRewardPerShare / 1e12;
-    token777.send(address(this), amount, ""); // may trigger tokensReceived callback
-    totalAssets += amount;
-}
-```
+- A malicious token callback could try to call a different index (`_index + 1`) in the same tx; `nonReentrant` blocks this today.
+- If future logic introduces index-moving operations (compaction, merge), stale index references can become a new exploit class.
 
-## 5. Realistic Exploit Scenario (step-by-step transaction flow)
-Transaction sequence (single-function):
-1. `Tx1`: attacker deposits 10 ETH. State: `bal[A]=10`, `vaultETH=10`.
-2. `Tx2`: attacker calls `withdraw(10)`.
-3. Vault performs external `call` before decrement; fallback re-enters `withdraw(10)`.
-4. Nested frame still sees `bal[A]=10`; sends another 10 ETH.
-5. Outer frame resumes and decrements once. Final: `bal[A]=0`, `vaultETH=-10` effective loss.
+Safer scalable alternative:
+- Use stake IDs (`mapping(uint256 => StakeInfo)` + owner mapping) instead of array index coupling.
 
-Transaction sequence (read-only reentrancy):
-1. Protocol computes collateral factor using `view` getter from a vault during liquidation.
-2. Getter depends on transient state updated after an external oracle adapter call.
-3. Adapter callback re-enters and changes reserve ratio path.
-4. Liquidation engine reads temporarily inflated health factor and skips liquidation.
-5. Attacker exits with bad debt window opened; no direct state mutation in the read path was needed.
+## 7. Pull vs Push Reward Distribution
+Current model is push-on-claim (`safeTransfer` in same call).
 
-Public references:
-- The DAO (2016) classic recursive withdraw.
-- Curve read-only reentrancy incident class (2022) illustrating pricing/`view` path hazards.
+- **Push pros:** simple UX; immediate settlement.
+- **Push cons:** external call in core logic; harder to isolate transfer failures.
+- **Pull alternative:** record claimable credits and let users withdraw separately.
 
-## 6. Defensive Design Patterns
-- CEI: checks -> effects -> interactions.
-- Mutex (`ReentrancyGuard`) on critical entry points.
-- Pull-payment for user withdrawals/claims.
-- Snapshot-and-settle design (freeze inputs before external calls).
-- Explicit non-reentrant read paths where views feed critical decisions.
+Tradeoff summary:
+- Pull-based architecture improves isolation and composability, but adds state and one extra user action.
 
-| Pattern | Best Use | Limitation | Strong Pairing |
-|---|---|---|---|
-| CEI | Simple single-function flows | Misses cross-function/read-only paths | CEI + invariant tests |
-| Mutex | Shared mutable state | Can block composability | mutex + segmented state |
-| Pull payments | Payout-heavy systems | Requires user claim UX | pull + claim caps |
-| Snapshot checks | Oracle/health reads | Snapshot freshness risk | snapshot + staleness bounds |
+## 8. Design Improvements & Hardening Opportunities in YieldCore
+### Weaknesses / limitations
+- Reentrancy defense is function-local, not architecture-level.
+- `safeTransferFrom` paths (`stake`, `fundRewardPool`) rely on token behavior assumptions.
+- Array-index stake model can become fragile under future feature growth.
 
-## 7. EVM-Level Reasoning
-- `CALL` transfers control and gas; attacker can invoke any reachable external/public entrypoint.
-- `SSTORE` ordering defines which values reentrant frames observe.
-- `DELEGATECALL` extends reentrancy risk across proxy modules using shared storage.
-- ERC777 and ERC1155 receiver hooks are explicit callback edges.
+### Alternative designs
+1. **Two-phase accounting + payout queue**
+   - Phase A: settle reward/unstake into internal credit.
+   - Phase B: dedicated `withdrawCredit` transfer path.
+2. **Stake NFT model**
+   - Each stake represented by transferable/non-transferable position token with isolated accounting.
+3. **Modular vault split**
+   - Core accounting module has zero token transfers; treasury module handles transfers only.
 
-Compiler/EVM version notes:
-- Solidity 0.8+ adds checked arithmetic but does not prevent reentrancy.
-- Gas-cost changes across forks (e.g., stipend assumptions) invalidate reliance on `transfer` as a guard.
-- Newer compiler defaults (ABI encoder v2, optimizer behavior) can change call surface but not the core reentry model.
+### Tradeoffs
+- **Gas:** extra writes for credit-based settlement.
+- **Complexity:** more modules and user actions.
+- **UX:** delayed token receipt unless batched.
+- **Security:** much stronger fault isolation and clearer invariants.
 
-## 8. Common Developer Mistakes
-- Assuming `view` paths are always safe when used by critical execution logic.
-- Guarding `withdraw` but not sibling state-mutating functions.
-- Updating user state but forgetting global state before interaction.
-- Trusting token transfer semantics across ERC20/777/1155 uniformly.
+### Real DeFi grounding
+- MasterChef-like systems often separate reward accrual and token extraction checkpoints.
+- Mature lending protocols isolate accounting from token transfer orchestration and rely on explicit invariant testing across modules.
 
-## 9. Explicit, Strong Invariants
-```solidity
-function invariant_globalSolvency() public {
-    assertGe(totalAssetsOnChain() + collectibleDebt(), totalUserClaims());
-}
-
-function invariant_singleUseEntitlement(address u) public {
-    assertLe(claimed[u][epoch], entitled[u][epoch]);
-}
-
-function invariant_indexMonotonic() public {
-    assertGe(accRewardPerShare(), lastAccRewardPerShare());
-}
-```
-
-### How Tests Should Catch This
-- Fuzz with attacker callback contract that re-enters all public functions.
-- Invariant harness should fail when nested calls make `totalUserClaims()` exceed assets.
-- Add a test where liquidation reads a view during reentrant callback and assert liquidation eligibility is unchanged.
