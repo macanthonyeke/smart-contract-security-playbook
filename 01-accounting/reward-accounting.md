@@ -1,84 +1,113 @@
 # Reward Accounting
 
-## Overview
-Reward systems fail when entitlement math is ambiguous under asynchronous deposits, withdrawals, and emissions. Correct design requires deterministic pro-rata accrual, bounded rounding error, and explicit solvency checks between promised rewards and funded reserves.
+## 1. Title
+Reward Accounting
 
-## Core Mental Model
-Canonical model:
-- `accRewardPerShare` (ARPS): cumulative reward index scaled by precision.
-- `rewardDebt[user]`: user checkpoint equal to `user.amount * ARPS` at last mutation.
-- Pending reward: `pending = user.amount * ARPS - rewardDebt[user]`.
+## 2. Overview
+Reward accounting must allocate emissions proportionally over time and stake weight without creating phantom rewards or unfair extraction opportunities.
 
-On each state mutation:
-1. Update global pool index from elapsed emissions/funding.
-2. Realize user pending if needed.
-3. Update user amount.
-4. Reset `rewardDebt` to `user.amount * ARPS`.
+## 3. Core Mental Model
+**Definition:** Use a cumulative index (`accRewardPerShare`) and per-user checkpoint (`rewardDebt`) so entitlement is the delta between current index exposure and previously settled exposure.
 
-This separates global accrual from user settlement and avoids O(n) loops.
+Core equations:
+- `pending_u = amount_u * accRPS / PRECISION - rewardDebt_u`
+- After mutation: `rewardDebt_u = amount_u * accRPS / PRECISION`
 
-## Minimal Vulnerable Example (Solidity or pseudocode)
+### Why This Matters in DeFi/Real Protocols
+Incorrect reward math silently transfers value between users and can bankrupt incentive pools long before operators detect insolvency.
+
+## 4. Minimal Vulnerable Example (Solidity or pseudocode)
 ```solidity
-uint256 public accRewardPerShare; // 1e12 precision
-mapping(address => uint256) public amount;
-mapping(address => uint256) public rewardDebt;
-
 function deposit(uint256 a) external {
-    // Vulnerable ordering: updates user before settling pending rewards.
+    // bug: user amount changes before settling pending
     amount[msg.sender] += a;
-    rewardDebt[msg.sender] = amount[msg.sender] * accRewardPerShare / 1e12;
-    stakeToken.transferFrom(msg.sender, address(this), a);
+    rewardDebt[msg.sender] = amount[msg.sender] * accRPS / 1e12;
+    stake.transferFrom(msg.sender, address(this), a);
 }
 
 function claim() external {
-    uint256 pending = amount[msg.sender] * accRewardPerShare / 1e12 - rewardDebt[msg.sender];
-    rewardDebt[msg.sender] = amount[msg.sender] * accRewardPerShare / 1e12;
-    rewardToken.transfer(msg.sender, pending);
+    uint256 p = amount[msg.sender] * accRPS / 1e12 - rewardDebt[msg.sender];
+    rewardDebt[msg.sender] = amount[msg.sender] * accRPS / 1e12;
+    reward.transfer(msg.sender, p);
 }
 ```
 
-## Realistic Exploit Scenario (step-by-step transaction flow)
-1. Pool emits rewards per block but does not enforce funding solvency.
-2. Attacker monitors mempool for keeper `updatePool()` transaction increasing ARPS materially.
-3. Attacker front-runs with deposit timed just before update/claim boundary to maximize index capture.
-4. Due to ordering bug, attacker’s `rewardDebt` reset suppresses fair historic debt or captures unearned delta.
-5. Attacker claims immediately after update and extracts outsized rewards.
-6. Underfunded pool cannot satisfy later honest claims; remaining users receive partial payouts.
+## 5. Realistic Exploit Scenario (step-by-step transaction flow)
+Front-run timing race:
+1. Keeper tx in mempool will call `updatePool()` and increase `accRPS`.
+2. Attacker `TxA` deposits just before keeper update.
+3. `TxK` executes update with new emission delta.
+4. Attacker `TxB` claims immediately.
+5. If ordering/checkpoint logic is wrong, attacker captures disproportionate share.
 
-Underfunded reward pool variant:
-- Protocol promises fixed APY via emission schedule disconnected from reward token treasury.
-- Claims succeed early, then revert/short-pay once reserve depleted.
-- Attackers farm and exit early, externalizing insolvency to late participants.
+Underfunded pool sequence:
+1. Protocol sets high emission schedule without funded reserve.
+2. Early claimers drain reward token balance.
+3. Later claims revert or underpay.
+4. Pool appears healthy by accounting, but payout solvency invariant is broken.
 
-Rounding residue extraction attack:
-- Integer division truncation leaves residual dust each update.
-- If residue handling is naive, attacker repeatedly cycles minimal stake/unstake to harvest predictable dust accumulation.
-- Over many iterations, dust becomes material leakage.
+Rounding residue numeric example:
+- Epoch rewards: 10 tokens each for 3 epochs.
+- Total shares each epoch = 3.
+- Per epoch distribution: `10/3 = 3` each, residue `1` token.
+- If residue is not carried, 3 tokens total become extractable dust.
+- Attacker cycles tiny stake around epoch boundaries to capture dust-biased rounding repeatedly.
 
-## Defensive Design Patterns
-- **Strict update ordering**: `updatePool` -> settle pending -> mutate stake -> set `rewardDebt`.
-- **Funding-aware emissions**: cap distributed rewards by available balance or streamed funding.
-- **High precision index**: use large scaler (e.g., 1e12/1e18) with bounded overflow analysis.
-- **Residue policy**: track remainder explicitly and carry forward; never leave unowned truncation paths.
-- **Claim throttling guards**: prevent same-block timing edge abuse when design depends on delayed settlement.
-- **Separate accounting from transfer success**: only finalize state if reward transfer semantics are deterministic.
+Public references:
+- MasterChef-style reward distribution design discussions and known mis-implementations in yield farms.
 
-## EVM-Level Reasoning
-- Arithmetic truncation is deterministic; attackers can optimize around it with many cheap calls.
-- Reordering `SSTORE` around external token transfers can create inconsistent debt snapshots on reentry/revert edges.
-- Fee-on-transfer/rebasing tokens alter actual received amounts versus nominal `a`; accounting must use observed deltas.
-- Block timestamp/number based emissions introduce miner/validator influence at boundaries.
+## 6. Defensive Design Patterns
+- `updatePool` first, then settle user, then mutate stake, then checkpoint debt.
+- Enforce funded emissions (`distributed <= funded + reserve`).
+- Carry residue forward explicitly in accumulator.
+- Use high precision and tested rounding policy.
+- Bound same-block claim/deposit edge behavior.
 
-## Common Developer Mistakes
-- Updating `rewardDebt` before paying pending rewards.
-- Assuming reward token balance is always sufficient for promised emissions.
-- Ignoring token behavior deviations (fee-on-transfer, rebasing, hooks).
-- Using low precision scaler, causing large cumulative truncation error.
-- Failing to snapshot before user amount changes.
+Specific off-by-one logic errors:
+- Using `lastRewardBlock = block.number` before computing elapsed blocks.
+- Including current block twice in elapsed interval.
+- Incorrect epoch boundary comparison (`<` vs `<=`) causing one extra emission step.
 
-## Explicit, Strong Invariants
-- **Emission solvency**: cumulative claimed rewards <= cumulative funded rewards + initial reserves.
-- **Pro-rata fairness**: user cumulative claim equals time-integral of user share of total stake (within bounded rounding epsilon).
-- **Index monotonicity**: `accRewardPerShare` never decreases.
-- **Debt consistency**: after each user mutation, `rewardDebt[user] == amount[user] * ARPS / PRECISION`.
-- **Residue conservation**: distributed rewards + tracked residue == total accrued rewards.
+## 7. EVM-Level Reasoning
+- Integer division truncation is exploitable through repeated low-cost calls.
+- Token transfers may deliver less than nominal amount; accounting must use balance deltas.
+- Reentrancy through token hooks can desync `amount` and `rewardDebt` if not guarded.
+
+## 8. Common Developer Mistakes
+- Updating debt before paying pending rewards.
+- Assuming rewards are always funded.
+- Ignoring fee-on-transfer/rebasing semantics.
+- Not testing boundary blocks/epochs.
+
+## 9. Explicit, Strong Invariants
+```solidity
+function invariant_emissionSolvency() public {
+    assertLe(totalClaimed(), totalFunded() + initialReserve());
+}
+
+function invariant_debtConsistency(address u) public {
+    assertEq(rewardDebt(u), amount(u) * accRPS() / PRECISION);
+}
+
+function invariant_residueConservation() public {
+    assertEq(totalDistributed() + residue(), totalAccrued());
+}
+```
+
+Solidity test examples:
+```solidity
+function test_underfundedPool_revertsClaim() public {
+    fund(1 ether); setEmission(100 ether);
+    vm.expectRevert(); pool.claim();
+}
+
+function test_frontRunDepositClaimBoundary() public {
+    // simulate attacker deposit before update and immediate claim
+    // assert payout <= fairShare + epsilon
+}
+```
+
+### How Tests Should Catch This
+- Stateful fuzzing with randomized `deposit/withdraw/claim/updatePool` ordering should fail if debt consistency breaks.
+- Epoch-boundary tests should assert no extra block rewards are minted.
+- Adversarial tiny-stake loop should not increase attacker EV beyond configured rounding epsilon.

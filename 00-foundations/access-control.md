@@ -1,76 +1,126 @@
 # Access Control
 
-## Overview
-Access control failures are usually value-routing failures: unauthorized principals gain write access to parameters, balances, upgrade paths, or emergency controls. Most critical incidents are not missing `onlyOwner`; they are flawed privilege boundaries and unsafe role composition.
+## 1. Title
+Access Control
 
-## Core Mental Model
-Define a privilege graph: principals -> capabilities -> affected invariants. Security review checks whether any path grants a principal the ability to violate conservation, authorization, or upgrade integrity constraints. Every privileged action should have explicit blast-radius bounds and delay/oversight assumptions.
+## 2. Overview
+Access control defines who can change critical state. In DeFi, authorization bugs are usually value-routing bugs: unauthorized actors gain power to mint, upgrade, drain, or censor.
 
-## Minimal Vulnerable Example (Solidity or pseudocode)
+## 3. Core Mental Model
+**Definition:** Access control is the mapping from principals to capabilities, with constraints on delegation, escalation, and timing.
+
+Model a privilege graph:
+- Nodes: EOAs, multisigs, timelocks, modules.
+- Edges: grant/revoke/execute rights.
+- Protected invariants: custody, upgrade integrity, parameter safety.
+
+### Role inheritance anti-patterns
+- Child role inherits admin rights unintentionally from parent role.
+- `DEFAULT_ADMIN_ROLE` reused as day-to-day operator.
+- Role can grant itself a stronger role through indirect admin chain.
+
+### Why This Matters in DeFi/Real Protocols
+Most catastrophic losses come from privileged functions (upgrade, oracle, treasury) being reachable by the wrong actor or reachable too quickly.
+
+## 4. Minimal Vulnerable Example (Solidity or pseudocode)
 ```solidity
-contract Vault {
-    address public owner;
-    mapping(address => bool) public isOperator;
-    address public implementation;
+contract ACL {
+    mapping(bytes32 => mapping(address => bool)) public hasRole;
+    bytes32 constant OPERATOR = keccak256("OPERATOR");
+    bytes32 constant ADMIN = keccak256("ADMIN");
 
-    function setOperator(address who, bool ok) external {
-        require(msg.sender == owner || isOperator[msg.sender], "forbidden");
-        // Privilege escalation: operators can add operators.
-        isOperator[who] = ok;
+    function grant(bytes32 role, address who) external {
+        require(hasRole[role][msg.sender], "self-admin anti-pattern");
+        hasRole[role][who] = true; // operator can create more operators forever
     }
 
-    function upgradeTo(address newImpl) external {
-        require(isOperator[msg.sender], "forbidden");
-        implementation = newImpl;
+    function upgradeTo(address impl) external {
+        require(hasRole[OPERATOR][msg.sender], "forbidden"); // over-broad
+        _setImplementation(impl);
     }
 }
 ```
 
-## Realistic Exploit Scenario (step-by-step transaction flow)
-1. Protocol designates automation bot as low-trust operator for routine tasks.
-2. Buggy role logic allows any operator to grant operator role to arbitrary addresses.
-3. Attacker compromises bot key or obtains temporary operator privileges.
-4. Attacker self-grants persistent operator/admin powers.
-5. Attacker calls privileged parameter setters: fee recipient, oracle source, liquidation bonus.
-6. Attacker invokes upgrade function to malicious implementation and drains assets.
-7. Governance cannot react in time because no timelock or pause separation existed.
+Proxy storage collision snippet:
+```solidity
+// Proxy slot 0 stores admin.
+contract ProxyStorage { address public admin; }
 
-## Defensive Design Patterns
-- **Least privilege by capability**: split roles by narrow action set (pause, parameter-tune, treasury-move, upgrade).
-- **No self-escalation**: role admins should be disjoint from role members for sensitive roles.
-- **Timelocked governance**: high-impact actions delayed with cancel path and monitoring window.
-- **Two-step ownership transfer**: `transferOwnership` + `acceptOwnership` to prevent misassignment.
-- **Multisig + quorum diversity**: avoid single-key catastrophic authority.
-- **Explicit upgrade gatekeeping**: `onlyProxyAdmin`, immutable admin routing, and event-rich upgrade pipeline.
+// New impl mistakenly puts uint256 totalSupply at slot 0.
+contract ImplV2 {
+    uint256 public totalSupply; // collides with admin slot in proxy context
+    function mint(uint256 x) external { totalSupply += x; }
+}
+```
+If called via proxy/delegatecall, `mint` mutates slot 0 and corrupts admin, potentially breaking or hijacking access control.
 
-Upgradeable proxy risk hotspots:
-- **Uninitialized implementation/proxy**: attacker initializes and captures admin state.
-- **Storage collision**: new implementation corrupts admin or accounting slots due to layout mismatch.
-- **Exposed upgrade function**: implementation contains callable upgrade entrypoints not properly restricted.
+## 5. Realistic Exploit Scenario (step-by-step transaction flow)
+Sequence (privilege escalation + upgrade):
+1. `Tx1`: bot key has OPERATOR for routine pausing.
+2. `Tx2`: attacker compromises bot and calls `grant(OPERATOR, attacker)`.
+3. `Tx3`: attacker sets malicious implementation via `upgradeTo`.
+4. `Tx4`: malicious logic drains treasury.
 
-Governance and parameter manipulation risks:
-- Setting oracle heartbeat too long, allowing stale price usage.
-- Raising borrow caps/LTV abruptly to create bad debt window.
-- Changing fee routing to attacker-controlled sink.
-- Lowering liquidation penalties to enable self-liquidation extraction.
+Sequence (governance delay + hierarchy accumulation):
+1. Proposal A grants ROLE_X as temporary emergency role.
+2. Proposal B queued to change ROLE_X admin to itself after delay.
+3. Due to hierarchy misdesign, ROLE_X can then grant ADMIN-like capabilities.
+4. After delay, attacker-controlled ROLE_X accumulates privileges not intended at proposal time.
 
-## EVM-Level Reasoning
-- Authorization is runtime predicate evaluation on `msg.sender` and storage roles; delegatecall-based proxies execute implementation code in proxy storage context.
-- Any storage slot overlap in upgradeable systems can mutate authorization variables unintentionally.
-- Constructor logic is absent in proxy deployments; initialization must be explicit and one-time guarded.
-- `delegatecall` turns implementation bugs into proxy-state compromise, including role mappings and admin addresses.
+Public references:
+- Parity multisig library authorization failure class (2017).
+- Multiple proxy-admin misconfiguration incidents across upgradeable protocols.
 
-## Common Developer Mistakes
-- Reusing `DEFAULT_ADMIN_ROLE` as operational role.
-- Allowing role members to administer their own role.
-- Failing to revoke deployer/bootstrap privileges.
-- Missing timelock on upgrade and treasury functions.
-- Using `tx.origin` or brittle EOA checks for auth.
-- Forgetting initializer guards (`initializer`/versioned reinitializer).
+## 6. Defensive Design Patterns
+- Capability-scoped roles (separate pause, parameter, treasury, upgrade).
+- Non-self-admin role graph (`roleAdmin[role] != role` for critical roles).
+- Timelock for high-impact ops, fast-path pause only.
+- Two-step ownership handover.
+- Upgrade allowlist + on-chain bytecode hash checks.
+- Storage layout checks in CI for proxy upgrades.
 
-## Explicit, Strong Invariants
-- **Authorization invariant**: for each privileged function `f`, only principals in approved capability set `C_f` can change protected state.
-- **Non-escalation invariant**: no principal outside governance root can grant itself or peers a role with wider capability than currently held.
-- **Upgrade integrity invariant**: implementation changes require timelock + authorized executor and preserve storage layout constraints.
-- **Parameter safety invariant**: governance-tunable parameters remain inside audited min/max bounds.
-- **Least-privilege invariant**: compromise of any single operational key cannot transfer custody or upgrade logic.
+Invariant-tied pattern tests:
+```solidity
+function invariant_onlyUpgradeRoleCanUpgrade(address caller) public {
+    vm.prank(caller);
+    if (!hasRole(UPGRADER, caller)) vm.expectRevert();
+    try proxy.upgradeTo(address(newImpl)) {} catch {}
+}
+
+function invariant_noSelfEscalation(address a) public {
+    assertFalse(canEscalateWithoutTimelock(a));
+}
+```
+
+## 7. EVM-Level Reasoning
+- Authorization checks execute in proxy storage context under `delegatecall`.
+- Storage collisions can rewrite role/admin slots.
+- Uninitialized proxy/implementation allows hostile initializer capture.
+- Selector clashes and fallback routing can expose unintended privileged paths.
+
+## 8. Common Developer Mistakes
+- Leaving initialization callable after deployment.
+- Making operational role admin of itself.
+- No bound checks on governance-set parameters.
+- Forgetting revoke flows for bootstrap keys.
+
+## 9. Explicit, Strong Invariants
+```solidity
+function invariant_authz(address c) public {
+    if (!hasRole(PARAM_ADMIN, c)) assertEq(lastParamSetter(), trustedParamSetter());
+}
+
+function invariant_upgradeIntegrity() public {
+    assertTrue(lastUpgradeExecutedByTimelock());
+    assertTrue(storageLayoutCompatible(currentImpl()));
+}
+
+function invariant_leastPrivilege() public {
+    assertFalse(singleOperationalKeyCanMoveTreasuryAndUpgrade());
+}
+```
+
+### How Tests Should Catch This
+- Differential tests across upgrade simulate storage layout drift; fail if admin slot changes unexpectedly.
+- Fuzz role grant/revoke sequences; fail if unprivileged caller can eventually upgrade.
+- Temporal test: queue proposal then attempt early execute; must revert before `minDelay`.

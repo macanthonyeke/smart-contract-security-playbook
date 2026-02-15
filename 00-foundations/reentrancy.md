@@ -1,86 +1,125 @@
 # Reentrancy
 
-## Overview
-Reentrancy occurs when control flow leaves a contract before its critical state transitions are finalized, then re-enters and observes or mutates partially updated state. The result is duplicated entitlement, broken accounting, and insolvency. Treat every external call as an adversarial context switch.
+## 1. Title
+Reentrancy
 
-## Core Mental Model
-Model each state-changing function as an atomic transition over a ledger invariant set. Reentrancy is a violation of atomicity: an attacker forces interleaving of transitions so that preconditions are checked against stale state and effects are applied multiple times. The defense objective is not only “block recursive calls,” but “preserve invariant truth under arbitrary call interleavings.”
+## 2. Overview
+Reentrancy is a control-flow attack where untrusted external code re-enters protocol logic before the original function completes, allowing repeated use of stale assumptions.
 
-Taxonomy:
-- **Single-function reentrancy**: re-enter the same function before state update (classic withdraw bug).
-- **Cross-function reentrancy**: enter another function sharing mutable state (e.g., `withdraw()` then `transferStake()`).
-- **Cross-contract reentrancy**: re-entry path traverses another protocol that calls back.
-- **Read-only reentrancy**: view/read path returns manipulated transient state used by downstream pricing/health checks.
-- **Token-hook reentrancy**: callbacks from token standards (ERC777 `tokensReceived`, ERC1155 receiver hooks) re-enter business logic.
+## 3. Core Mental Model
+**Definition:** A state transition is reentrant-vulnerable when external control transfer occurs before all critical state writes that enforce value conservation and authorization.
 
-## Minimal Vulnerable Example (Solidity or pseudocode)
+Think in three layers:
+1. **Precondition snapshot** (what checks depend on).
+2. **State transition** (what must become true atomically).
+3. **External interaction boundary** (where attacker can interrupt).
+
+If layer (3) happens before layer (2) is finalized, invariants can be violated under nested call graphs.
+
+Reentrancy taxonomy:
+- Single-function reentrancy.
+- Cross-function reentrancy.
+- Cross-contract reentrancy.
+- Read-only reentrancy.
+- Token-hook reentrancy (ERC777/1155).
+
+### Why This Matters in DeFi/Real Protocols
+Lending, vaults, and AMMs rely on globally consistent balances, debt shares, and price snapshots. Reentrancy breaks this consistency and can turn small local bugs into system-wide insolvency.
+
+## 4. Minimal Vulnerable Example (Solidity or pseudocode)
 ```solidity
-// Vulnerable: interaction before effect.
-function withdraw(uint256 amount) external {
-    require(balance[msg.sender] >= amount, "insufficient");
-    (bool ok,) = msg.sender.call{value: amount}("");
-    require(ok, "send failed");
-    balance[msg.sender] -= amount;
+contract Vault {
+    mapping(address => uint256) public bal;
+
+    function deposit() external payable {
+        bal[msg.sender] += msg.value;
+    }
+
+    function withdraw(uint256 amount) external {
+        require(bal[msg.sender] >= amount, "insufficient");
+        (bool ok,) = msg.sender.call{value: amount}(""); // interaction first
+        require(ok, "send failed");
+        bal[msg.sender] -= amount; // effect too late
+    }
 }
 ```
 
-ERC777 callback-shaped variant:
+ERC777 hook-shaped vulnerability:
 ```solidity
-// Vault accepts ERC777 and credits shares before finalizing global accounting.
-function deposit(uint256 amount) external {
-    shares[msg.sender] += quoteShares(amount);
-    // ERC777 transfer can trigger recipient/sender hooks and re-enter claim/withdraw.
-    token.send(address(this), amount, "");
+function deposit777(uint256 amount) external {
+    shares[msg.sender] += previewShares(amount); // credited early
+    rewardDebt[msg.sender] = shares[msg.sender] * accRewardPerShare / 1e12;
+    token777.send(address(this), amount, ""); // may trigger tokensReceived callback
     totalAssets += amount;
 }
 ```
 
-## Realistic Exploit Scenario (step-by-step transaction flow)
-1. Attacker deploys a contract with fallback/`tokensReceived` callback.
-2. Attacker seeds a small position in vulnerable vault.
-3. Attacker calls `withdraw()` (or `deposit()` in ERC777-hook scenario).
-4. Vault performs external call (`call`, token transfer/hook trigger) before finalizing ledger state.
-5. Callback re-enters `withdraw()`/`claim()` while original frame still sees old balances or old cumulative index.
-6. Re-entry drains additional funds or mints excess entitlement.
-7. Loop repeats until vault balance or gas limits are reached.
+## 5. Realistic Exploit Scenario (step-by-step transaction flow)
+Transaction sequence (single-function):
+1. `Tx1`: attacker deposits 10 ETH. State: `bal[A]=10`, `vaultETH=10`.
+2. `Tx2`: attacker calls `withdraw(10)`.
+3. Vault performs external `call` before decrement; fallback re-enters `withdraw(10)`.
+4. Nested frame still sees `bal[A]=10`; sends another 10 ETH.
+5. Outer frame resumes and decrements once. Final: `bal[A]=0`, `vaultETH=-10` effective loss.
 
-DAO technical breakdown:
-- The DAO split mechanism transferred ETH before decrementing sender balance.
-- Attacker contract fallback re-entered split/withdraw path repeatedly.
-- Each recursion passed balance checks against stale state.
-- Net effect: same entitlement consumed multiple times, draining funds into child DAO structure.
-- Root cause: violated atomicity and invariant “sum(user balances) <= treasury assets.”
+Transaction sequence (read-only reentrancy):
+1. Protocol computes collateral factor using `view` getter from a vault during liquidation.
+2. Getter depends on transient state updated after an external oracle adapter call.
+3. Adapter callback re-enters and changes reserve ratio path.
+4. Liquidation engine reads temporarily inflated health factor and skips liquidation.
+5. Attacker exits with bad debt window opened; no direct state mutation in the read path was needed.
 
-## Defensive Design Patterns
-- **CEI (Checks-Effects-Interactions)**: apply all effects before external interaction.
-- **ReentrancyGuard/mutex**: serialize entry to critical sections (`nonReentrant`) when state coupling is broad.
-- **Pull payments**: store owed amounts and let users withdraw in isolated transfer function with hardened logic.
-- **State partitioning**: isolate accounting by function or subsystem to reduce shared mutable state.
-- **External-call minimization**: avoid callbacks during critical state transitions; wrap token operations defensively.
-- **Two-phase accounting**: commit debt/credit, then settle transfer separately.
+Public references:
+- The DAO (2016) classic recursive withdraw.
+- Curve read-only reentrancy incident class (2022) illustrating pricing/`view` path hazards.
 
-CEI limitations:
-- CEI in one function does not protect cross-function paths sharing state.
-- CEI does not solve read-only reentrancy if external observers consume transient values.
-- CEI fails if invariants depend on external contracts with mutable callbacks.
-- CEI is brittle in upgradeable systems where new functions can introduce unsafe interaction order.
+## 6. Defensive Design Patterns
+- CEI: checks -> effects -> interactions.
+- Mutex (`ReentrancyGuard`) on critical entry points.
+- Pull-payment for user withdrawals/claims.
+- Snapshot-and-settle design (freeze inputs before external calls).
+- Explicit non-reentrant read paths where views feed critical decisions.
 
-## EVM-Level Reasoning
-- `CALL` hands control to untrusted code with forwarded gas; any reachable public/external function can be invoked.
-- Storage writes (`SSTORE`) only become visible in current execution context immediately; if delayed until after `CALL`, re-entrant frames read stale slots.
-- Reverts roll back frame-local effects but do not guarantee protocol-level safety if partial operations are split across multiple external calls.
-- Token hooks (ERC777/1155) are explicit callback points; treat them as attacker-controlled re-entry edges in call graph analysis.
+| Pattern | Best Use | Limitation | Strong Pairing |
+|---|---|---|---|
+| CEI | Simple single-function flows | Misses cross-function/read-only paths | CEI + invariant tests |
+| Mutex | Shared mutable state | Can block composability | mutex + segmented state |
+| Pull payments | Payout-heavy systems | Requires user claim UX | pull + claim caps |
+| Snapshot checks | Oracle/health reads | Snapshot freshness risk | snapshot + staleness bounds |
 
-## Common Developer Mistakes
-- Assuming `transfer`/2300 stipend is a permanent mitigation.
-- Guarding only one function while other state-mutating functions remain re-enterable.
-- Updating user balance but not global totals (or vice versa) before interaction.
-- Trusting ERC20 semantics while integrating ERC777-like tokens with hooks.
-- Ignoring read-only reentrancy in pricing, health-factor, or collateral checks.
+## 7. EVM-Level Reasoning
+- `CALL` transfers control and gas; attacker can invoke any reachable external/public entrypoint.
+- `SSTORE` ordering defines which values reentrant frames observe.
+- `DELEGATECALL` extends reentrancy risk across proxy modules using shared storage.
+- ERC777 and ERC1155 receiver hooks are explicit callback edges.
 
-## Explicit, Strong Invariants
-- **Global solvency**: `totalAssetsOnChain + collectibleDebt >= sum(userWithdrawable)` at all times.
-- **Single-consumption entitlement**: for each user and epoch/index, claimable rewards can be reduced from positive to zero at most once per entitlement unit.
-- **Conservation under interleaving**: any prefix of nested call frames must not observe `sum(userBalances) > accountedAssets`.
-- **Monotonic cumulative index**: reward/share indices never decrease and user settlement cannot exceed delta-index entitlement.
-- **Authorization + liveness boundary**: only intended principals can trigger settlement on behalf of a user; failed transfer paths must not mint or burn net value.
+Compiler/EVM version notes:
+- Solidity 0.8+ adds checked arithmetic but does not prevent reentrancy.
+- Gas-cost changes across forks (e.g., stipend assumptions) invalidate reliance on `transfer` as a guard.
+- Newer compiler defaults (ABI encoder v2, optimizer behavior) can change call surface but not the core reentry model.
+
+## 8. Common Developer Mistakes
+- Assuming `view` paths are always safe when used by critical execution logic.
+- Guarding `withdraw` but not sibling state-mutating functions.
+- Updating user state but forgetting global state before interaction.
+- Trusting token transfer semantics across ERC20/777/1155 uniformly.
+
+## 9. Explicit, Strong Invariants
+```solidity
+function invariant_globalSolvency() public {
+    assertGe(totalAssetsOnChain() + collectibleDebt(), totalUserClaims());
+}
+
+function invariant_singleUseEntitlement(address u) public {
+    assertLe(claimed[u][epoch], entitled[u][epoch]);
+}
+
+function invariant_indexMonotonic() public {
+    assertGe(accRewardPerShare(), lastAccRewardPerShare());
+}
+```
+
+### How Tests Should Catch This
+- Fuzz with attacker callback contract that re-enters all public functions.
+- Invariant harness should fail when nested calls make `totalUserClaims()` exceed assets.
+- Add a test where liquidation reads a view during reentrant callback and assert liquidation eligibility is unchanged.
